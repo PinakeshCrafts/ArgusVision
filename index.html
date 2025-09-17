@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI surveillance system</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/tensorflow/4.15.0/tf.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.4/moment.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@emailjs/browser@3/dist/email.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono&display=swap" rel="stylesheet">   
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="login-overlay" id="loginOverlay">
+        <div class="login-container">
+            <div class="side-image">
+                <img src="unnamed.png" alt="Security System">
+            </div>
+            <div class="login-form">
+                <h1 class="title">Login</h1>
+                <form id="loginForm">
+                    <div class="form-group">
+                        <label for="name">Name</label>
+                        <input type="text" id="name" required placeholder="Enter your name">
+                        <div class="error-message" id="nameError"></div>
+                    </div>
+                    <div class="form-group">
+                        <label for="email">Email</label>
+                        <input type="email" id="email" required placeholder="Enter your email">
+                        <div class="error-message" id="emailError"></div>
+                    </div>
+                    <button type="submit" class="login-btn">Login</button>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <div class="loading-overlay" id="loadingOverlay">Loading AI Model...</div>
+
+    <div class="notification" id="emailNotification">Email alert sent successfully!</div>
+
+    <nav class="navbar">
+        <h1>AI surveillance system</h1>
+        <div class="user-info" id="userInfo"></div>
+        <div id="timer">00:00:00</div>
+    </nav>
+
+    <div class="main-content">
+        <div class="camera-section">
+            <div class="camera-container">
+                <button class="mirror-btn" id="mirrorBtn">↔️ Flip</button>
+                <video id="webcam" autoplay playsinline></video>
+                <canvas id="canvas"></canvas>
+            </div>
+            <div class="controls">
+                <button class="btn" id="photoBtn">📸 Snapshot</button>
+                <button class="btn" id="recordBtn">🔴 Record</button>
+                <button class="btn" id="autoRecordBtn">🎯 Auto Record</button>
+            </div>
+        </div>
+
+        <div class="sidebar">
+            <div class="status-indicator">
+                <div class="status-dot" id="statusDot"></div>
+                <span id="statusText">Loading...</span>
+            </div>
+            <div class="activity-log">
+                <h2>ACTIVITY LOG</h2>
+                <div id="activityContainer"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Initialize EmailJS
+        (function() {
+            emailjs.init("yOSX3VHJ1ATMpu1y1");
+        })();
+
+        // Global variables
+        let model;
+        let isRecording = false;
+        let autoRecordEnabled = false;
+        let mediaRecorder = null;
+        let recordedChunks = [];
+        let recordingStartTime = null;
+        let timerInterval = null;
+        let lastPersonDetectionTime = null;
+        let lastNotificationTime = 0;
+        let mirrored = false;
+        let noPersonTimeout = null;
+        let userEmail = '';
+        let userName = '';
+
+        // DOM elements
+        const video = document.getElementById('webcam');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+
+        // Login form handling
+        document.getElementById('loginForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            document.getElementById('nameError').style.display = 'none';
+            document.getElementById('emailError').style.display = 'none';
+            
+            userName = document.getElementById('name').value.trim();
+            userEmail = document.getElementById('email').value.trim();
+            
+            let isValid = true;
+            
+            if (userName.length < 2) {
+                document.getElementById('nameError').textContent = 'Name must be at least 2 characters';
+                document.getElementById('nameError').style.display = 'block';
+                isValid = false;
+            }
+            
+            if (!userEmail.match(/^[^\s@]+@[^\s@]+\.[^\s@]+$/)) {
+                document.getElementById('emailError').textContent = 'Please enter a valid email address';
+                document.getElementById('emailError').style.display = 'block';
+                isValid = false;
+            }
+            
+            if (isValid) {
+                document.getElementById('loginOverlay').style.display = 'none';
+                document.getElementById('userInfo').textContent = `User: ${userName}`;
+                await initialize();
+            }
+        });
+
+        // Email notification function
+        async function sendEmail(message) {
+            const currentTime = Date.now();
+            if (currentTime - lastNotificationTime > 600000) { // 10 minutes cooldown
+                try {
+                    await emailjs.send(
+                        "service_x0qqh0z",
+                        "template_tr6u4qr",
+                        {
+                            to_email: userEmail,
+                            message: message,
+                        }
+                    );
+                    
+                    const notification = document.getElementById('emailNotification');
+                    notification.style.display = 'block';
+                    setTimeout(() => {
+                        notification.style.display = 'none';
+                    }, 3000);
+                    
+                    lastNotificationTime = currentTime;
+                    addActivity('Email alert sent');
+                } catch (error) {
+                    console.error('Failed to send email:', error);
+                    addActivity('Failed to send email alert');
+                }
+            }
+        }
+
+        // Initialize system
+        async function initialize() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { 
+                        width: { ideal: 1280 },
+                        height: { ideal: 720 }
+                    },
+                    audio: true 
+                });
+                
+                video.srcObject = stream;
+                
+                // Initialize MediaRecorder
+                mediaRecorder = new MediaRecorder(stream);
+                mediaRecorder.ondataavailable = handleDataAvailable;
+                mediaRecorder.onstop = handleRecordingStop;
+                
+                // Load COCO-SSD model
+                model = await cocoSsd.load();
+                
+                document.getElementById('loadingOverlay').style.display = 'none';
+                updateStatus('active', 'System Ready');
+                addActivity('System initialized');
+                
+                // Start detection loop
+                detectPerson();
+            } catch (error) {
+                console.error('Initialization error:', error);
+                updateStatus('error', 'System Error');
+                addActivity(`Error: ${error.message}`);
+            }
+        }
+        // Person detection function
+        async function detectPerson() {
+            if (model && video.readyState === 4) {
+                try {
+                    const predictions = await model.detect(video);
+                    
+                    // Clear previous drawings
+                    canvas.width = video.videoWidth;
+                    canvas.height = video.videoHeight;
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+                    let personDetected = false;
+                    
+                    predictions.forEach(prediction => {
+                        if (prediction.class === 'person') {
+                            personDetected = true;
+                            lastPersonDetectionTime = Date.now();
+                            const [x, y, width, height] = prediction.bbox;
+                            
+                            // Draw bounding box
+                            ctx.strokeStyle = '#00ff00';
+                            ctx.lineWidth = 2;
+                            ctx.strokeRect(x, y, width, height);
+                            
+                            // Draw label
+                            ctx.fillStyle = '#00ff00';
+                            ctx.font = '16px Arial';
+                            ctx.fillText(
+                                `Person ${Math.round(prediction.score * 100)}%`,
+                                x, y > 20 ? y - 5 : 20
+                            );
+
+                            // Handle auto-recording
+                            if (autoRecordEnabled && !isRecording) {
+                                startRecording();
+                                sendEmail(`Person detected at ${moment().format('YYYY-MM-DD HH:mm:ss')}`);
+                            }
+                            
+                            // Clear the no-person timeout
+                            if (noPersonTimeout) {
+                                clearTimeout(noPersonTimeout);
+                                noPersonTimeout = null;
+                            }
+                        }
+                    });
+
+                    if (!personDetected && isRecording) {
+                        // Set timeout to stop recording after 5 seconds of no person detected
+                        if (!noPersonTimeout) {
+                            noPersonTimeout = setTimeout(() => {
+                                if (isRecording) {
+                                    stopRecording();
+                                    addActivity('Recording stopped - No person detected for 5 seconds');
+                                }
+                            }, 5000);
+                        }
+                    }
+                } catch (error) {
+                    console.error('Detection error:', error);
+                }
+            }
+            requestAnimationFrame(detectPerson);
+        }
+
+        // Recording handlers
+        function handleDataAvailable(event) {
+            if (event.data.size > 0) {
+                recordedChunks.push(event.data);
+            }
+        }
+
+        function handleRecordingStop() {
+            const blob = new Blob(recordedChunks, { type: 'video/webm' });
+            recordedChunks = [];
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            const timestamp = moment().format('YYYY-MM-DD-HH-mm-ss');
+            a.href = url;
+            a.download = `security-recording-${timestamp}.webm`;
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+
+        function startRecording() {
+            if (mediaRecorder && mediaRecorder.state === 'inactive') {
+                recordedChunks = [];
+                mediaRecorder.start();
+                isRecording = true;
+                recordingStartTime = Date.now();
+                timerInterval = setInterval(updateTimer, 1000);
+                document.getElementById('recordBtn').classList.add('active');
+                updateStatus('active', 'Recording');
+                addActivity('Recording started');
+            }
+        }
+
+        function stopRecording() {
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                mediaRecorder.stop();
+                isRecording = false;
+                recordingStartTime = null;
+                clearInterval(timerInterval);
+                updateTimer();
+                document.getElementById('recordBtn').classList.remove('active');
+                updateStatus('active', 'System Ready');
+                addActivity('Recording stopped');
+            }
+        }
+
+        // Timer update function
+        function updateTimer() {
+            const timer = document.getElementById('timer');
+            if (!recordingStartTime) {
+                timer.textContent = '00:00:00';
+                return;
+            }
+            const elapsed = Date.now() - recordingStartTime;
+            const time = new Date(elapsed);
+            timer.textContent = time.toISOString().substr(11, 8);
+        }
+
+        // Status update function
+        function updateStatus(state, text) {
+            const statusDot = document.getElementById('statusDot');
+            const statusText = document.getElementById('statusText');
+            statusDot.className = `status-dot ${state}`;
+            statusText.textContent = text;
+        }
+
+        // Activity log function
+        function addActivity(message) {
+            const container = document.getElementById('activityContainer');
+            const time = moment().format('HH:mm:ss');
+            const activityHtml = `
+                <div class="activity-item">
+                    <div class="activity-time">${time}</div>
+                    ${message}
+                </div>
+            `;
+            container.insertAdjacentHTML('afterbegin', activityHtml);
+        }
+
+        // Screenshot function
+        function takeSnapshot() {
+            const timestamp = moment().format('YYYY-MM-DD-HH-mm-ss');
+            const snapshotCanvas = document.createElement('canvas');
+            snapshotCanvas.width = video.videoWidth;
+            snapshotCanvas.height = video.videoHeight;
+            const snapshotCtx = snapshotCanvas.getContext('2d');
+            
+            if (mirrored) {
+                snapshotCtx.scale(-1, 1);
+                snapshotCtx.translate(-video.videoWidth, 0);
+            }
+            
+            snapshotCtx.drawImage(video, 0, 0);
+            snapshotCtx.drawImage(canvas, 0, 0);
+            
+            const link = document.createElement('a');
+            link.download = `security-snapshot-${timestamp}.png`;
+            link.href = snapshotCanvas.toDataURL('image/png');
+            link.click();
+            
+            addActivity('Snapshot captured');
+        }
+
+        // Event listeners
+        document.getElementById('photoBtn').addEventListener('click', takeSnapshot);
+        
+        document.getElementById('recordBtn').addEventListener('click', () => {
+            if (isRecording) {
+                stopRecording();
+            } else {
+                startRecording();
+            }
+        });
+
+        document.getElementById('autoRecordBtn').addEventListener('click', () => {
+            autoRecordEnabled = !autoRecordEnabled;
+            document.getElementById('autoRecordBtn').classList.toggle('active');
+            addActivity(autoRecordEnabled ? 'Auto-record enabled' : 'Auto-record disabled');
+        });
+
+        document.getElementById('mirrorBtn').addEventListener('click', () => {
+            mirrored = !mirrored;
+            video.style.transform = mirrored ? 'scaleX(-1)' : '';
+            canvas.style.transform = mirrored ? 'scaleX(-1)' : '';
+            addActivity(mirrored ? 'Camera view mirrored' : 'Camera view normal');
+        });
+
+        // Handle page unload
+        window.addEventListener('beforeunload', () => {
+            if (isRecording) {
+                stopRecording();
+            }
+        });
+    </script>
+</body>
